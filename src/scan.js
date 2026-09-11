@@ -212,7 +212,34 @@ async function main() {
   console.log(`\nScanning ${targetUrls.length} pages x ${VIEWPORTS.length} viewports = ${totalPageLoads} page loads, concurrency=${args.concurrency}${args.nocache ? ', cache-busting ON' : ''}`);
   if (checkpointed.size) console.log(`${checkpointed.size} already done, ${totalPageLoads - checkpointed.size} remaining.`);
 
-  const browser = await chromium.launch({ headless: true });
+  // Confirmed live (2026-09-11): the shared Chromium instance can crash
+  // mid-run ("Target crashed") - when it does, every task sharing that one
+  // browser fails identically forever after, since nothing relaunched it.
+  // A full run silently lost results for 223 of 468 page loads this way
+  // before this fix. browserHolder makes the current browser instance
+  // swappable, and each task retries once against a freshly relaunched
+  // browser if it hits a crash/disconnect error, rather than assuming the
+  // browser it was handed is still alive.
+  const browserHolder = { current: await chromium.launch({ headless: true }) };
+  let relaunchInFlight = null;
+  // When the shared browser crashes, every concurrent task notices at once -
+  // without this, each would race to relaunch independently, with later
+  // relaunches closing over earlier tasks' freshly-started browser. Coalesce
+  // into a single relaunch that all of them await together.
+  async function relaunchBrowser(deadBrowser) {
+    if (browserHolder.current !== deadBrowser) return; // someone already relaunched past this one
+    if (!relaunchInFlight) {
+      relaunchInFlight = (async () => {
+        try { await deadBrowser.close(); } catch (e) { /* already dead */ }
+        browserHolder.current = await chromium.launch({ headless: true });
+      })().finally(() => { relaunchInFlight = null; });
+    }
+    await relaunchInFlight;
+  }
+  function isCrashError(err) {
+    const msg = String(err && err.message ? err.message : err);
+    return /Target crashed|Target page, context or browser has been closed|Browser has been closed|Connection closed/i.test(msg);
+  }
 
   const pageResults = [];
   const tasks = [];
@@ -223,12 +250,23 @@ async function main() {
         pageResults.push(checkpointed.get(key));
         continue; // already scanned in a previous run - don't re-launch a browser for it
       }
-      tasks.push(() =>
-        scanOnePage(browser, url, viewport, { nocache: args.nocache }).then((result) => {
-          appendCheckpoint(args.outDir, result);
-          return result;
-        })
-      );
+      tasks.push(async () => {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const browserForThisAttempt = browserHolder.current;
+          try {
+            const result = await scanOnePage(browserForThisAttempt, url, viewport, { nocache: args.nocache });
+            appendCheckpoint(args.outDir, result);
+            return result;
+          } catch (err) {
+            if (attempt < 2 && isCrashError(err)) {
+              console.log(`  browser crashed scanning ${url} (${viewport.name}) - relaunching and retrying...`);
+              await relaunchBrowser(browserForThisAttempt);
+              continue;
+            }
+            throw err;
+          }
+        }
+      });
     }
   }
 
@@ -250,7 +288,7 @@ async function main() {
   });
   pageResults.push(...newResults);
 
-  await browser.close();
+  try { await browserHolder.current.close(); } catch (e) { /* already dead from a crash - fine */ }
   if (interrupted) return; // onInterrupt already exited the process
 
   const errors = pageResults.filter((r) => r && r.error);
